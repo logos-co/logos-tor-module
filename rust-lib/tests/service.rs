@@ -8,7 +8,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{ping, Echo};
 use logos_tor::service::{Backend, Engine, Service};
@@ -72,6 +72,19 @@ fn proxy(service: &Service) -> String {
     service.status().socks.unwrap().trim_start_matches("socks5h://").to_string()
 }
 
+/// The SOCKS relay counts bytes once it has passed them on, on the service's own threads, so
+/// a client can read them before they are counted.
+fn settled(service: &Service, done: impl Fn(&Counts) -> bool) -> Counts {
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let c = service.usage();
+        if done(&c) || Instant::now() >= until {
+            return c;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn client() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
 }
@@ -87,7 +100,7 @@ fn a_reconnect_keeps_the_port_and_the_counts() {
 
     let mut held = rt.block_on(Socks5Stream::connect(addr.as_str(), ("zec.rocks", 443))).unwrap();
     assert_eq!(&rt.block_on(ping(&mut held)), b"ping");
-    assert_eq!(service.usage(), Counts { sent: 4, received: 4, opened: 1, open: 1 });
+    assert_eq!(settled(&service, |c| c.received == 4), Counts { sent: 4, received: 4, opened: 1, open: 1 });
 
     service.reconnect(false).unwrap();
     assert_eq!(fake.launches.load(Ordering::SeqCst), 2);
@@ -102,7 +115,7 @@ fn a_reconnect_keeps_the_port_and_the_counts() {
 
     let mut again = rt.block_on(Socks5Stream::connect(addr.as_str(), ("zec.rocks", 443))).unwrap();
     assert_eq!(&rt.block_on(ping(&mut again)), b"ping");
-    let c = service.usage();
+    let c = settled(&service, |c| c.received == 8);
     assert_eq!((c.sent, c.received, c.opened), (8, 8, 2), "counted since the module started");
     service.stop(Duration::from_millis(500));
 }
