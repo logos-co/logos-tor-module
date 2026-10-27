@@ -10,9 +10,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tor_socksproto::{Handshake as _, NextStep, SocksAuth, SocksCmd, SocksRequest, SocksStatus, SocksVersion};
+use tor_socksproto::{Handshake as _, NextStep, SocksCmd, SocksRequest, SocksStatus, SocksVersion};
 
-use crate::usage::{Counted, Usage};
+use crate::tor::Isolation;
+use crate::usage::{Counted, Reads, Usage};
 
 /// A client that names no target within this long is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -27,8 +28,8 @@ pub struct Target {
     pub port: u16,
     /// SOCKS4 and 4a carry IPv4 only.
     pub ipv4_only: bool,
-    /// The credentials, which choose the circuit.
-    pub isolation: SocksAuth,
+    /// Which circuit it may share: a SOCKS client's credentials, or a module's key.
+    pub isolation: Isolation,
 }
 
 /// The stream, or the SOCKS status to answer with and why.
@@ -70,13 +71,13 @@ async fn handle(dialer: &dyn Dial, mut stream: TcpStream, usage: Arc<Usage>) -> 
         host: request.addr().to_string(),
         port: request.port(),
         ipv4_only: request.version() == SocksVersion::V4,
-        isolation: request.auth().clone(),
+        isolation: Isolation::Socks(request.auth().clone()),
     };
     match dialer.dial(target).await {
         Ok(mut remote) => {
             reply(&mut stream, &request, SocksStatus::SUCCEEDED).await?;
             let _open = usage.open_stream();
-            let mut app = Counted::new(stream, usage.clone());
+            let mut app = Counted::new(stream, usage.socks().clone(), Reads::Sent);
             // Either side closing ends the relay; how it ended concerns no one.
             let _ = tokio::io::copy_bidirectional(&mut app, &mut remote).await;
             Ok(())

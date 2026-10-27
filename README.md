@@ -2,67 +2,110 @@
 
 `tor_module`: Tor for Logos modules, so no one has to install or run Tor themselves. It
 runs [Arti](https://gitlab.torproject.org/tpo/core/arti), the Tor Project's Tor in Rust,
-inside the module's own process, and offers it as a SOCKS port on loopback. Any module
-that can use a SOCKS proxy can go through it: the wallets' lightwalletd, Electrum, node
-and RPC connections all can.
+inside the module's own process. Modules make their requests through it over IPC: the
+module learns who is asking, keeps each module's circuits apart, and opens no port. Other
+programs can reach it through a SOCKS port, which the user turns on in the Tor app.
 
-## Using it
+## Requests over IPC
 
-List `tor_module` in your module's `dependencies`; the host loads it with yours. Ask for
-`status()` and use its `socks` URL as your proxy:
+List `tor_module` in your module's `dependencies`; the host loads it with yours. Start a
+request, then ask for its response until it is done:
+
+```text
+request(spec, body) -> { "ok": true, "request": "9f1c…" }
+response("9f1c…")   -> { "ok": true, "state": "pending" }
+response("9f1c…")   -> { "ok": true, "state": "done", "status": 200, "headers": [["content-type", "application/grpc"]],
+                         "trailers": [["grpc-status", "0"]], "body": "<base64>", "http2": true }
+```
+
+`spec` is JSON and `body` is bytes:
 
 ```json
-{ "ok": true, "state": "ready", "progress": 100, "detail": "…", "socks": "socks5h://127.0.0.1:53171",
+{ "method": "POST", "url": "https://zec.rocks/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+  "headers": [["content-type", "application/grpc"], ["te", "trailers"]],
+  "http2": true, "isolation": "sync-3", "timeoutMs": 60000 }
+```
+
+- **https anywhere, plain http to onion services only**: Tor encrypts an onion service's
+  traffic end to end, while anywhere else the exit relay would read plain http. TLS is
+  checked against the Mozilla roots. Nothing on this computer or its network is reached.
+- **HTTP/1.1, or HTTP/2** where the server offers it. `http2: true` asks for HTTP/2 alone,
+  as gRPC needs; to an onion service it is spoken from the start (h2c). Trailers come back,
+  so a gRPC client reads `grpc-status` from them.
+- **Circuits:** requests with the same `isolation` may share a circuit, and an HTTP/2
+  connection, as a gRPC client's calls do; with none, each request gets its own. Two
+  modules never share a circuit, whatever keys they pick.
+- A finished request is answered once, as `done` or `{ state: "failed", error }`, then
+  forgotten. Only the module that started it may ask for it or `cancel(request)` it.
+- Limits: 64 requests in flight per module, 8 MB of request body, 64 MB of response body,
+  timeouts from 1 s to 10 min (60 s when unset).
+- **Why ask rather than wait:** the module runs with `concurrency: "single"`, so each reply
+  goes to its caller alone. A `multi` module's results travel as events that reach every
+  module connected to it. Every call returns at once and requests run in the background.
+- A Reconnect or Forget in the Tor app ends requests in flight: they answer
+  `interrupted: Tor restarted`.
+
+## Status
+
+`status()` answers:
+
+```json
+{ "ok": true, "state": "ready", "progress": 100, "detail": "…", "socks": null,
   "since": 1793098512345, "joinMs": 13712 }
 ```
 
-- `state` is `connecting`, `ready`, `blocked` (no progress for a while: no network, or
-  Tor blocked on this one) or `failed` (Tor could not start, or joining failed; it is
+- `state` is `idle`, `connecting`, `ready`, `blocked` (no progress for a while: no network,
+  or Tor blocked on this one) or `failed` (Tor could not start, or joining failed; it is
   tried again every minute). `detail` is Arti's own description.
-- **Tor starts when an app asks.** Loaded, the module only opens its port: it reads
-  `idle` and makes no connection, so a user whose apps all skip Tor shows no Tor traffic
-  on the network. The first `status()` call from another module, or the first connection
-  to the port, starts the join, so a module never reads `idle` itself. Once started, Tor
-  runs until the module unloads.
-- `socks` is chosen when the module loads and kept until it unloads, through reconnects.
-  Ask for it each time the module loads rather than storing it.
+- **Tor starts when an app needs it.** Loaded, the module reads `idle` and makes no
+  connection, so a user whose apps all skip Tor shows no Tor traffic on the network. A
+  request, a `status()` call from another module, or a SOCKS client starts the join, so a
+  module never reads `idle` itself. Once started, Tor runs until the module unloads.
+- `socks` is the SOCKS port, `socks5h://IP:PORT`, while the user has it on; else null.
 - `since` is when the state began (unix ms); `joinMs`, how long the last start took to
   be ready.
-- A connection made while Tor is still connecting waits for it.
 - `status_changed(payload)` carries the same reply whenever the state, the progress or
-  the port changes.
-- A module that asks counts as an app following Tor, for 90 s: the Tor app lists it.
+  the SOCKS port changes.
+- A module that asks or makes a request counts as an app following Tor for 90 s: the Tor
+  app lists it.
 
 ## The SOCKS port
 
-- SOCKS4, 4a and 5, `CONNECT` only, on 127.0.0.1. Names are resolved by Tor at the exit,
-  so use `socks5h` or 4a: resolving locally would leak them.
+Off unless the user turns it on in the Tor app, for programs outside Logos. It listens at
+`127.0.0.1:9250` unless the user names another IP and port, clear of a system Tor's 9050
+and Tor Browser's 9150. The choice is saved in `settings.json` in the instance directory.
+
+- SOCKS4, 4a and 5, `CONNECT` only. Names are resolved by Tor at the exit, so use
+  `socks5h` or 4a: resolving locally would leak them.
 - **Circuits follow the SOCKS credentials**, as with Tor's `IsolateSOCKSAuth`: streams
-  whose username and password differ never share a circuit. Send fresh random
-  credentials for a fresh circuit, and different ones per purpose, so that your traffic
-  and other modules' cannot be linked by a shared circuit. Streams without credentials
+  whose username and password differ never share a circuit. Streams without credentials
   can share circuits with each other.
 - Onion services are reachable. A failure answers with the status Arti's own SOCKS port
   gives, onion service codes included (Tor proposal 304).
-- No authentication is required, as with a system Tor: any program on this computer
-  could use the port.
-- Nothing about a connection's target is logged.
+- No authentication is required, as with a system Tor: any program on this computer can
+  use the port, and on an address other than loopback, any computer that reaches it.
+- The port stays the same through a Reconnect. Nothing about a connection's target is
+  logged.
 
 ## Managing it
 
 The Tor app (`tor_ui`) manages it; these calls are refused to every other caller. A
 `callers.json` in the instance directory, `{"modules": [...], "allowHost": true}`, admits
-more, for tests.
+more, for tests; `allowHost` also lets `logosctl call` make requests.
 
 - `usage()`: `{ ok, startedAt, sent, received, streams: { open, total }, files, memory,
-  apps: [{ module, seenAt }] }`. Bytes the apps sent into Tor and received from it, and
-  the streams it opened, since the module started; the bytes in Arti's files; this
-  process's memory; the modules that asked for `status()` in the last 90 s.
+  apps: [{ module, seenAt, active, sent, received, requests }], socks: { sent, received } }`.
+  Bytes into Tor and out of it and the Tor streams opened since the module started; each
+  module's share, and the SOCKS port's; the bytes in Arti's files; this process's memory.
+  `active` is true for a module seen in the last 90 s.
+- `settings()` and `set_socks(enabled, address)`: `{ ok, socks: { enabled, address,
+  listening, error } }`. An address that cannot be listened on is refused, and the port
+  stays as it was.
 - `log_tail(lines)`: `{ ok, entries: [{ at, level, target, message }] }`, Arti's last
   log entries at INFO and up. The log is kept in memory only (500 entries), and Arti
   scrubs addresses from it.
-- `reconnect()`: stops Arti and starts it again on the same port, an idle Tor included.
-  Open streams end; their apps reconnect.
+- `reconnect()`: stops Arti and starts it again, an idle Tor included. Requests and SOCKS
+  streams in flight end; their apps try again.
 - `forget_data()`: the same, with Arti's state (the entry guards it picked) and its
   directory cache deleted in between. Tor picks new guards and downloads the directory
   again, about 7 MB. It fixes a join stuck on guards that stopped answering, but new
@@ -86,11 +129,13 @@ directory, readable by the user alone. Measured on macOS with a release build:
 ```bash
 nix build .#lgx .#default        # the plugin and its package, as the host loads them
 
-# Unit and SOCKS tests: no network, no module glue
+# Offline: unit tests, the SOCKS port, and requests against a fake Tor whose far side is
+# an in-process TLS, HTTP/1.1 and HTTP/2 server
 cargo test --manifest-path rust-lib/Cargo.toml --no-default-features
 
-# Joins the real Tor network and reaches a site and an onion service through the port,
-# then reconnects and forgets Tor's data (a second cold join, about 7 MB)
+# Joins the real Tor network: a site and an onion service through the SOCKS port, a gRPC
+# call to testnet.zec.rocks and the onion service with requests, then a reconnect and a
+# forget (a second cold join, about 7 MB)
 cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --test live -- --ignored --nocapture
 ```
 

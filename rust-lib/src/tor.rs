@@ -16,11 +16,16 @@ use crate::socks::{Dial, Dialed, Stream, Target};
 
 pub type Client = Arc<TorClient<PreferredRuntime>>;
 
-/// Streams may share a circuit only when their SOCKS credentials are equal.
+/// What decides which streams may share a circuit: only streams whose isolation is equal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ByCredentials(SocksAuth);
+pub enum Isolation {
+    /// A SOCKS client's credentials, as Tor's IsolateSOCKSAuth.
+    Socks(SocksAuth),
+    /// A module's request over IPC: the module, and a key it chose. No two modules share.
+    App { module: String, key: String },
+}
 
-impl IsolationHelper for ByCredentials {
+impl IsolationHelper for Isolation {
     fn compatible_same_type(&self, other: &Self) -> bool {
         self == other
     }
@@ -80,7 +85,7 @@ impl Dial for Tor {
                 prefs.ipv4_only();
             }
             prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
-            prefs.set_isolation(ByCredentials(target.isolation));
+            prefs.set_isolation(target.isolation);
             let addr = (target.host, target.port)
                 .into_tor_addr()
                 .map_err(|e| (SocksStatus::ADDRTYPE_NOT_SUPPORTED, e.to_string()))?;
