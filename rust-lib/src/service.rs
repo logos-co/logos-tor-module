@@ -118,8 +118,9 @@ pub struct Service {
 }
 
 impl Service {
-    /// Opens the SOCKS port and starts joining Tor, with Arti's files under `dir`. When Tor
-    /// cannot start, the status says why and the port answers each client with a failure.
+    /// Opens the SOCKS port, with Arti's files under `dir`; Tor joins once something asks.
+    /// When Tor cannot start, the status says why and the port answers each client with a
+    /// failure.
     pub fn start(dir: &Path, sink: Sink) -> Result<Self, String> {
         Self::start_with(dir, sink, Arc::new(Arti))
     }
@@ -206,10 +207,11 @@ impl Service {
         if self.stopped.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        self.tracker.relaunch(if forget { "forgetting Tor's data" } else { "reconnecting" });
+        // The old run stops first, so no late event of its own overwrites the new status.
         if let Some(old) = run.take() {
             old.stop(RESTART_GRACE);
         }
+        self.tracker.relaunch(if forget { "forgetting Tor's data" } else { "reconnecting" });
         let forgot = if forget { forget_files(&self.dir) } else { Ok(()) };
         let new = self.launch()?;
         new.wake();
