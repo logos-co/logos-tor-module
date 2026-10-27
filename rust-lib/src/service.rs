@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use arti_client::status::BlockageKind;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -21,7 +22,7 @@ use tor_socksproto::SocksStatus;
 use crate::http::{self, Pool, Prepared, Spec};
 use crate::requests::{Polled, Requests, PER_MODULE};
 use crate::socks::{self, Dial, Dialed, Target};
-use crate::status::{from_progress, Progress, Sink, State, Status, Tracker};
+use crate::status::{from_progress, Blockage, Progress, Sink, State, Status, Tracker, DIRECTORY_GRACE};
 use crate::tor::{Client, Tor};
 use crate::usage::{now_ms, AppCounts, Counts, Meter, Usage};
 
@@ -426,17 +427,49 @@ fn forget_files(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn blockage(kind: &BlockageKind) -> Blockage {
+    match kind {
+        BlockageKind::Offline => Blockage::Offline,
+        BlockageKind::Filtering => Blockage::Filtering,
+        BlockageKind::ClockSkewed => Blockage::Clock,
+        BlockageKind::CantBootstrap => Blockage::Directory,
+        _ => Blockage::CantReachTor,
+    }
+}
+
 /// Joins Tor and follows Arti's progress.
 async fn join(client: Client, tracker: Tracker) {
     let joined = Arc::new(AtomicBool::new(false));
     let mut events = client.bootstrap_events();
     let (follower, seen) = (tracker.clone(), joined.clone());
     tokio::spawn(async move {
-        while let Some(s) = events.next().await {
-            let (blocked, detail) = (s.blocked().map(|b| b.to_string()), s.to_string());
-            let progress = Progress { fraction: s.as_frac(), ready: s.ready_for_traffic(), blocked: blocked.as_deref(), detail: &detail };
-            let (state, pct, detail) = from_progress(&progress, seen.load(Ordering::Relaxed));
-            follower.update(|st| (st.state, st.progress, st.detail) = (state, pct, detail));
+        let (mut last, mut stuck_since) = (None, None::<Instant>);
+        loop {
+            // A stuck directory turns into Blocked when its grace runs out, event or not.
+            let due = stuck_since.map(|t| t + DIRECTORY_GRACE).filter(|t| *t > Instant::now());
+            tokio::select! {
+                event = events.next() => match event {
+                    Some(s) => last = Some(s),
+                    None => return,
+                },
+                _ = async { tokio::time::sleep_until(due.unwrap().into()).await }, if due.is_some() => {}
+            }
+            let Some(s) = last.as_ref() else { continue };
+            let blocked = s.blocked().map(|b| (blockage(&b.kind()), b.to_string()));
+            stuck_since = match &blocked {
+                Some((Blockage::Directory, _)) => stuck_since.or(Some(Instant::now())),
+                _ => None,
+            };
+            let stalled = stuck_since.map(|t| t.elapsed()).unwrap_or_default();
+            let detail = s.to_string();
+            let progress = Progress {
+                fraction: s.as_frac(),
+                ready: s.ready_for_traffic(),
+                blocked: blocked.as_ref().map(|(kind, why)| (*kind, why.as_str())),
+                detail: &detail,
+            };
+            let (state, pct, detail, kind) = from_progress(&progress, seen.load(Ordering::Relaxed), stalled);
+            follower.update(|st| (st.state, st.progress, st.detail, st.blockage) = (state, pct, detail, kind));
         }
     });
     loop {
@@ -451,7 +484,7 @@ async fn join(client: Client, tracker: Tracker) {
                 return;
             }
             Err(e) => {
-                tracker.update(|s| (s.state, s.detail) = (State::Failed, e.to_string()));
+                tracker.update(|s| (s.state, s.detail, s.blockage) = (State::Failed, e.to_string(), None));
                 tokio::time::sleep(RETRY).await;
             }
         }

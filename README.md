@@ -51,12 +51,18 @@ response("9f1c…")   -> { "ok": true, "state": "done", "status": 200, "headers"
 
 ```json
 { "ok": true, "state": "ready", "progress": 100, "detail": "…", "socks": null,
-  "since": 1793098512345, "joinMs": 13712 }
+  "since": 1793098512345, "joinMs": 13712, "blockage": null }
 ```
 
-- `state` is `idle`, `connecting`, `ready`, `blocked` (no progress for a while: no network,
-  or Tor blocked on this one) or `failed` (Tor could not start, or joining failed; it is
-  tried again every minute). `detail` is Arti's own description.
+- `state` is `idle`, `connecting`, `ready`, `blocked` (no progress for a while) or `failed`
+  (Tor could not start, or joining failed; it is tried again every minute). `detail` is
+  Arti's own description.
+- `blockage` names what Arti judges is in the way, while it reports something: `offline`
+  (no connection opens), `filtering` (connections open, but no Tor handshake completes),
+  `clock` (this computer's clock is off), `cantReachTor`, or `directory` (directory
+  downloads keep failing or stalling). During the first join a stuck directory reads as
+  `connecting` for 3 minutes before `blocked`: on a slow connection its downloads time out
+  again and again before one completes, which Arti counts as stalls.
 - **Tor starts when an app needs it.** Loaded, the module reads `idle` and makes no
   connection, so a user whose apps all skip Tor shows no Tor traffic on the network. A
   request, a `status()` call from another module, or a SOCKS client starts the join, so a
