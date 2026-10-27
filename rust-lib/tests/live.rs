@@ -29,6 +29,8 @@ fn joins_tor_and_reaches_a_site_and_an_onion() {
     let log = heard.clone();
     let t0 = Instant::now();
     let service = Service::start(dir.path(), Arc::new(move |s| log.lock().unwrap().push(s.clone()))).unwrap();
+    assert_eq!(service.status().state, State::Idle);
+    service.demand();
     while service.status().state != State::Ready {
         assert!(t0.elapsed() < Duration::from_secs(180), "not ready: {:?}", service.status());
         std::thread::sleep(Duration::from_millis(200));

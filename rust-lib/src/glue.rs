@@ -14,12 +14,12 @@ use crate::usage::{self, now_ms, Followers};
 const NOT_AUTHORIZED: &str = r#"{"ok":false,"error":"not authorized"}"#;
 
 pub trait TorModule: Send + Sync + 'static {
-    /// `{ ok, state, progress, detail, socks, since, joinMs }`. `state` is connecting, ready,
-    /// blocked or failed; `progress` is the percent joined; `socks` is
+    /// `{ ok, state, progress, detail, socks, since, joinMs }`. `state` is idle, connecting,
+    /// ready, blocked or failed; `progress` is the percent joined; `socks` is
     /// `socks5h://127.0.0.1:PORT`, the same for as long as the module is loaded; `since` is
     /// when the state began (unix ms); `joinMs` is how long the last start took to be ready.
-    /// Connections made while connecting wait for Tor. A module that asks counts as an app
-    /// following Tor for 90 s.
+    /// A module that asks starts Tor if it is idle, so it never reads idle itself, and counts
+    /// as an app following Tor for 90 s. Connections made while connecting wait for Tor.
     fn status(&self) -> String;
     /// `{ ok, startedAt, sent, received, streams: { open, total }, files, memory,
     /// apps: [{ module, seenAt }] }`: bytes the apps sent and received through Tor and the
@@ -30,7 +30,7 @@ pub trait TorModule: Send + Sync + 'static {
     /// INFO and up, oldest first. The Tor app only.
     fn log_tail(&self, lines: i64) -> String;
     /// Stops Arti and starts it again on the same SOCKS port; open streams end. `{ ok }`
-    /// once it is joining again. The Tor app only.
+    /// once it is joining again. Starts an idle Tor. The Tor app only.
     fn reconnect(&self) -> String;
     /// Reconnects with Arti's state and directory cache deleted in between: new entry
     /// guards, and the directory downloaded again (about 7 MB). The Tor app only.
@@ -94,13 +94,18 @@ impl TorModuleImpl {
 
 impl TorModule for TorModuleImpl {
     fn status(&self) -> String {
-        if let Caller::Module(name) = caller() {
-            if name != APP {
-                self.followers.saw(&name, now_ms());
-            }
-        }
+        let app = match caller() {
+            Caller::Module(name) if name != APP => Some(name),
+            _ => None,
+        };
         match self.service() {
-            Ok(s) => s.status().to_json(),
+            Ok(s) => {
+                if let Some(name) = app {
+                    self.followers.saw(&name, now_ms());
+                    s.demand();
+                }
+                s.status().to_json()
+            }
             Err(e) => err(&e),
         }
     }
@@ -149,7 +154,7 @@ impl TorModule for TorModuleImpl {
         })
     }
 
-    /// Opens the SOCKS port and starts joining Tor, with Arti's files under `arti/`.
+    /// Opens the SOCKS port, with Arti's files under `arti/`. Tor joins when an app asks.
     fn on_context_ready(&self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
         let callers = std::fs::read_to_string(dir.join("callers.json")).ok();

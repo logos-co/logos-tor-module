@@ -1,5 +1,7 @@
 //! The running module: the SOCKS port, and Arti in a tokio runtime behind it. The port
-//! outlives each run of Arti, so reconnecting and forgetting Tor's data keep it.
+//! outlives each run of Arti, so reconnecting and forgetting Tor's data keep it. Arti joins
+//! the Tor network only once something asks for it: an app's status() call, a connection,
+//! or the user.
 
 use std::future::Future;
 use std::net::Ipv4Addr;
@@ -28,23 +30,54 @@ const RESTART_GRACE: Duration = Duration::from_millis(500);
 
 /// What answers behind the SOCKS port: Arti in the module, a fake in tests.
 pub trait Engine: Send + Sync + 'static {
-    /// Opens Tor with its files under `dir` and starts joining. Runs inside the run's
-    /// runtime, so it may spawn.
-    fn launch(&self, dir: &Path, tracker: &Tracker) -> Result<Arc<dyn Dial>, String>;
+    /// Opens Tor with its files under `dir`, without joining. Runs inside the run's runtime.
+    fn launch(&self, dir: &Path, tracker: &Tracker) -> Result<Arc<dyn Backend>, String>;
+}
+
+/// Tor behind the port.
+pub trait Backend: Dial {
+    /// Starts joining the Tor network unless it has. Runs inside the run's runtime.
+    fn wake(&self);
 }
 
 pub struct Arti;
 
 impl Engine for Arti {
-    fn launch(&self, dir: &Path, tracker: &Tracker) -> Result<Arc<dyn Dial>, String> {
-        let tor = Tor::create(dir)?;
-        tokio::spawn(join(tor.client().clone(), tracker.clone()));
-        Ok(Arc::new(tor))
+    fn launch(&self, dir: &Path, tracker: &Tracker) -> Result<Arc<dyn Backend>, String> {
+        Ok(Arc::new(ArtiBackend { tor: Tor::create(dir)?, tracker: tracker.clone(), woken: AtomicBool::new(false) }))
+    }
+}
+
+struct ArtiBackend {
+    tor: Tor,
+    tracker: Tracker,
+    woken: AtomicBool,
+}
+
+impl Backend for ArtiBackend {
+    fn wake(&self) {
+        if !self.woken.swap(true, Ordering::SeqCst) {
+            if self.tracker.get().state == State::Idle {
+                self.tracker.relaunch("starting");
+            }
+            tokio::spawn(join(self.tor.client().clone(), self.tracker.clone()));
+        }
+    }
+}
+
+impl Dial for ArtiBackend {
+    fn dial(&self, target: Target) -> Pin<Box<dyn Future<Output = Dialed> + Send + '_>> {
+        self.wake();
+        self.tor.dial(target)
     }
 }
 
 /// Answers every client with why Tor is not running.
 struct Down(String);
+
+impl Backend for Down {
+    fn wake(&self) {}
+}
 
 impl Dial for Down {
     fn dial(&self, _: Target) -> Pin<Box<dyn Future<Output = Dialed> + Send + '_>> {
@@ -55,6 +88,14 @@ impl Dial for Down {
 struct Run {
     runtime: Runtime,
     stop: watch::Sender<bool>,
+    backend: Arc<dyn Backend>,
+}
+
+impl Run {
+    fn wake(&self) {
+        let _in = self.runtime.enter();
+        self.backend.wake();
+    }
 }
 
 impl Run {
@@ -112,19 +153,30 @@ impl Service {
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
         let (stop, stopped) = watch::channel(false);
-        {
+        let backend = {
             let _in = runtime.enter();
             let listener = match self.listener.lock().unwrap().as_ref() {
                 Some(l) => l.try_clone().and_then(TcpListener::from_std).map_err(|e| format!("socks port: {e}"))?,
                 None => return Err("stopped".into()),
             };
-            let dialer = self.engine.launch(&self.dir, &self.tracker).unwrap_or_else(|e| {
+            let backend = self.engine.launch(&self.dir, &self.tracker).unwrap_or_else(|e| {
                 self.tracker.update(|s| (s.state, s.detail) = (State::Failed, e.clone()));
                 Arc::new(Down(e))
             });
-            runtime.spawn(socks::serve(listener, dialer, stopped, self.usage.clone()));
+            runtime.spawn(socks::serve(listener, backend.clone(), stopped, self.usage.clone()));
+            backend
+        };
+        Ok(Run { runtime, stop, backend })
+    }
+
+    /// Starts joining Tor unless it has: an app asked for it. A reconnect in progress
+    /// joins anyway, so this does not wait for it.
+    pub fn demand(&self) {
+        if let Ok(run) = self.run.try_lock() {
+            if let Some(run) = run.as_ref() {
+                run.wake();
+            }
         }
-        Ok(Run { runtime, stop })
     }
 
     pub fn status(&self) -> Status {
@@ -145,10 +197,10 @@ impl Service {
         &self.dir
     }
 
-    /// Stops Arti and starts it again on the same port; streams open now end. With `forget`,
-    /// Arti's state and cache go in between, so it picks new entry guards and downloads the
-    /// directory again. Returns once the new run is joining; an error from deleting the files
-    /// is returned after Tor started again.
+    /// Stops Arti and starts it again on the same port, joining at once; streams open now
+    /// end. With `forget`, Arti's state and cache go in between, so it picks new entry guards
+    /// and downloads the directory again. Returns once the new run is joining; an error from
+    /// deleting the files is returned after Tor started again.
     pub fn reconnect(&self, forget: bool) -> Result<(), String> {
         let mut run = self.run.lock().unwrap();
         if self.stopped.load(Ordering::SeqCst) {
@@ -159,7 +211,9 @@ impl Service {
             old.stop(RESTART_GRACE);
         }
         let forgot = if forget { forget_files(&self.dir) } else { Ok(()) };
-        *run = Some(self.launch()?);
+        let new = self.launch()?;
+        new.wake();
+        *run = Some(new);
         forgot
     }
 

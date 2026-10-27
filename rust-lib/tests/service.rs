@@ -3,20 +3,22 @@
 
 mod common;
 
+use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{ping, Echo};
-use logos_tor::service::{Engine, Service};
-use logos_tor::socks::Dial;
+use logos_tor::service::{Backend, Engine, Service};
+use logos_tor::socks::{Dial, Dialed, Target};
 use logos_tor::status::{State, Status, Tracker};
 use logos_tor::usage::Counts;
 use tokio::io::AsyncReadExt;
 use tokio_socks::tcp::Socks5Stream;
 
-/// Ready as soon as it launches, unless it fails.
+/// A Tor that is ready as soon as something wakes it, unless it fails to open.
 #[derive(Default)]
 struct Fake {
     launches: AtomicUsize,
@@ -24,7 +26,7 @@ struct Fake {
 }
 
 impl Engine for Fake {
-    fn launch(&self, dir: &Path, tracker: &Tracker) -> Result<Arc<dyn Dial>, String> {
+    fn launch(&self, dir: &Path, tracker: &Tracker) -> Result<Arc<dyn Backend>, String> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err("no Tor here".into());
@@ -32,8 +34,28 @@ impl Engine for Fake {
         for sub in ["state", "cache"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        tracker.update(|s| (s.state, s.progress) = (State::Ready, 100));
-        Ok(Arc::new(Echo::default()))
+        Ok(Arc::new(FakeTor { echo: Echo::default(), tracker: tracker.clone(), woken: AtomicBool::new(false) }))
+    }
+}
+
+struct FakeTor {
+    echo: Echo,
+    tracker: Tracker,
+    woken: AtomicBool,
+}
+
+impl Backend for FakeTor {
+    fn wake(&self) {
+        if !self.woken.swap(true, Ordering::SeqCst) {
+            self.tracker.update(|s| (s.state, s.progress) = (State::Ready, 100));
+        }
+    }
+}
+
+impl Dial for FakeTor {
+    fn dial(&self, target: Target) -> Pin<Box<dyn Future<Output = Dialed> + Send + '_>> {
+        self.wake();
+        self.echo.dial(target)
     }
 }
 
@@ -60,6 +82,7 @@ fn a_reconnect_keeps_the_port_and_the_counts() {
     let fake = Arc::new(Fake::default());
     let (service, heard) = start(dir.path(), fake.clone());
     let (addr, rt) = (proxy(&service), client());
+    service.demand();
     assert_eq!(service.status().state, State::Ready);
 
     let mut held = rt.block_on(Socks5Stream::connect(addr.as_str(), ("zec.rocks", 443))).unwrap();
@@ -81,6 +104,33 @@ fn a_reconnect_keeps_the_port_and_the_counts() {
     assert_eq!(&rt.block_on(ping(&mut again)), b"ping");
     let c = service.usage();
     assert_eq!((c.sent, c.received, c.opened), (8, 8, 2), "counted since the module started");
+    service.stop(Duration::from_millis(500));
+}
+
+#[test]
+fn tor_waits_until_an_app_asks_or_connects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _) = start(dir.path(), Arc::new(Fake::default()));
+    assert_eq!(service.status().state, State::Idle, "nothing asked yet");
+    assert!(service.status().socks.is_some(), "the port listens while idle");
+    service.demand();
+    assert_eq!(service.status().state, State::Ready);
+    service.stop(Duration::from_millis(500));
+
+    let (service, _) = start(dir.path(), Arc::new(Fake::default()));
+    let rt = client();
+    let mut s = rt.block_on(Socks5Stream::connect(proxy(&service).as_str(), ("zec.rocks", 443))).unwrap();
+    assert_eq!(&rt.block_on(ping(&mut s)), b"ping");
+    assert_eq!(service.status().state, State::Ready, "a connection wakes it too");
+    service.stop(Duration::from_millis(500));
+}
+
+#[test]
+fn a_reconnect_starts_an_idle_tor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _) = start(dir.path(), Arc::new(Fake::default()));
+    service.reconnect(false).unwrap();
+    assert_eq!(service.status().state, State::Ready);
     service.stop(Duration::from_millis(500));
 }
 

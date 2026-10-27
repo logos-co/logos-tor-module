@@ -10,6 +10,8 @@ use crate::usage::now_ms;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    /// Not started: no app has asked for Tor since the module loaded.
+    Idle,
     /// Joining the Tor network; connections wait until it is done.
     Connecting,
     /// Joined: connections go out at once.
@@ -36,8 +38,8 @@ pub struct Status {
 }
 
 impl Status {
-    pub fn starting() -> Self {
-        Self { state: State::Connecting, progress: 0, detail: "starting".into(), socks: None, since: now_ms(), join_ms: None }
+    pub fn idle() -> Self {
+        Self { state: State::Idle, progress: 0, detail: String::new(), socks: None, since: now_ms(), join_ms: None }
     }
 
     /// `{ ok: true, state, progress, detail, socks, since, joinMs }`.
@@ -87,7 +89,7 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn new(sink: Sink) -> Self {
-        Self { status: Arc::new(Mutex::new(Status::starting())), launched: Arc::new(Mutex::new(Instant::now())), sink }
+        Self { status: Arc::new(Mutex::new(Status::idle())), launched: Arc::new(Mutex::new(Instant::now())), sink }
     }
 
     pub fn get(&self) -> Status {

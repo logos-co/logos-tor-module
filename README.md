@@ -19,6 +19,11 @@ List `tor_module` in your module's `dependencies`; the host loads it with yours.
 - `state` is `connecting`, `ready`, `blocked` (no progress for a while: no network, or
   Tor blocked on this one) or `failed` (Tor could not start, or joining failed; it is
   tried again every minute). `detail` is Arti's own description.
+- **Tor starts when an app asks.** Loaded, the module only opens its port: it reads
+  `idle` and makes no connection, so a user whose apps all skip Tor shows no Tor traffic
+  on the network. The first `status()` call from another module, or the first connection
+  to the port, starts the join, so a module never reads `idle` itself. Once started, Tor
+  runs until the module unloads.
 - `socks` is chosen when the module loads and kept until it unloads, through reconnects.
   Ask for it each time the module loads rather than storing it.
 - `since` is when the state began (unix ms); `joinMs`, how long the last start took to
@@ -56,8 +61,8 @@ more, for tests.
 - `log_tail(lines)`: `{ ok, entries: [{ at, level, target, message }] }`, Arti's last
   log entries at INFO and up. The log is kept in memory only (500 entries), and Arti
   scrubs addresses from it.
-- `reconnect()`: stops Arti and starts it again on the same port. Open streams end;
-  their apps reconnect.
+- `reconnect()`: stops Arti and starts it again on the same port, an idle Tor included.
+  Open streams end; their apps reconnect.
 - `forget_data()`: the same, with Arti's state (the entry guards it picked) and its
   directory cache deleted in between. Tor picks new guards and downloads the directory
   again, about 7 MB. It fixes a join stuck on guards that stopped answering, but new
