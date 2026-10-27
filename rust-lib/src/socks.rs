@@ -12,6 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tor_socksproto::{Handshake as _, NextStep, SocksAuth, SocksCmd, SocksRequest, SocksStatus, SocksVersion};
 
+use crate::usage::{Counted, Usage};
+
 /// A client that names no target within this long is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -37,15 +39,16 @@ pub trait Dial: Send + Sync + 'static {
     fn dial(&self, target: Target) -> Pin<Box<dyn Future<Output = Dialed> + Send + '_>>;
 }
 
-/// Serves clients until `stop` turns true. Nothing about a client's target is logged.
-pub async fn serve(listener: TcpListener, dialer: Arc<dyn Dial>, mut stop: watch::Receiver<bool>) {
+/// Serves clients until `stop` turns true, counting their traffic into `usage`. Nothing about
+/// a client's target is logged.
+pub async fn serve(listener: TcpListener, dialer: Arc<dyn Dial>, mut stop: watch::Receiver<bool>, usage: Arc<Usage>) {
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    let dialer = dialer.clone();
+                    let (dialer, usage) = (dialer.clone(), usage.clone());
                     tokio::spawn(async move {
-                        let _ = handle(&*dialer, stream).await;
+                        let _ = handle(&*dialer, stream, usage).await;
                     });
                 }
                 // Out of file descriptors, say: wait instead of spinning.
@@ -56,7 +59,7 @@ pub async fn serve(listener: TcpListener, dialer: Arc<dyn Dial>, mut stop: watch
     }
 }
 
-async fn handle(dialer: &dyn Dial, mut stream: TcpStream) -> Result<(), String> {
+async fn handle(dialer: &dyn Dial, mut stream: TcpStream, usage: Arc<Usage>) -> Result<(), String> {
     let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream))
         .await
         .map_err(|_| "handshake timed out".to_string())??;
@@ -72,8 +75,10 @@ async fn handle(dialer: &dyn Dial, mut stream: TcpStream) -> Result<(), String> 
     match dialer.dial(target).await {
         Ok(mut remote) => {
             reply(&mut stream, &request, SocksStatus::SUCCEEDED).await?;
+            let _open = usage.open_stream();
+            let mut app = Counted::new(stream, usage.clone());
             // Either side closing ends the relay; how it ended concerns no one.
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
+            let _ = tokio::io::copy_bidirectional(&mut app, &mut remote).await;
             Ok(())
         }
         Err((status, why)) => {

@@ -12,17 +12,21 @@ List `tor_module` in your module's `dependencies`; the host loads it with yours.
 `status()` and use its `socks` URL as your proxy:
 
 ```json
-{ "ok": true, "state": "ready", "progress": 100, "detail": "…", "socks": "socks5h://127.0.0.1:53171" }
+{ "ok": true, "state": "ready", "progress": 100, "detail": "…", "socks": "socks5h://127.0.0.1:53171",
+  "since": 1793098512345, "joinMs": 13712 }
 ```
 
 - `state` is `connecting`, `ready`, `blocked` (no progress for a while: no network, or
   Tor blocked on this one) or `failed` (Tor could not start, or joining failed; it is
   tried again every minute). `detail` is Arti's own description.
-- `socks` is null until the port listens. The port is chosen at start, so ask for it
-  each time the module loads rather than storing it.
+- `socks` is chosen when the module loads and kept until it unloads, through reconnects.
+  Ask for it each time the module loads rather than storing it.
+- `since` is when the state began (unix ms); `joinMs`, how long the last start took to
+  be ready.
 - A connection made while Tor is still connecting waits for it.
 - `status_changed(payload)` carries the same reply whenever the state, the progress or
   the port changes.
+- A module that asks counts as an app following Tor, for 90 s: the Tor app lists it.
 
 ## The SOCKS port
 
@@ -38,6 +42,27 @@ List `tor_module` in your module's `dependencies`; the host loads it with yours.
 - No authentication is required, as with a system Tor: any program on this computer
   could use the port.
 - Nothing about a connection's target is logged.
+
+## Managing it
+
+The Tor app (`tor_ui`) manages it; these calls are refused to every other caller. A
+`callers.json` in the instance directory, `{"modules": [...], "allowHost": true}`, admits
+more, for tests.
+
+- `usage()`: `{ ok, startedAt, sent, received, streams: { open, total }, files, memory,
+  apps: [{ module, seenAt }] }`. Bytes the apps sent into Tor and received from it, and
+  the streams it opened, since the module started; the bytes in Arti's files; this
+  process's memory; the modules that asked for `status()` in the last 90 s.
+- `log_tail(lines)`: `{ ok, entries: [{ at, level, target, message }] }`, Arti's last
+  log entries at INFO and up. The log is kept in memory only (500 entries), and Arti
+  scrubs addresses from it.
+- `reconnect()`: stops Arti and starts it again on the same port. Open streams end;
+  their apps reconnect.
+- `forget_data()`: the same, with Arti's state (the entry guards it picked) and its
+  directory cache deleted in between. Tor picks new guards and downloads the directory
+  again, about 7 MB. It fixes a join stuck on guards that stopped answering, but new
+  guards also give an observer a new chance to sit at your entry, so it is no routine
+  step.
 
 ## Files and cost
 
@@ -59,7 +84,8 @@ nix build .#lgx .#default        # the plugin and its package, as the host loads
 # Unit and SOCKS tests: no network, no module glue
 cargo test --manifest-path rust-lib/Cargo.toml --no-default-features
 
-# Joins the real Tor network and reaches a site and an onion service through the port
+# Joins the real Tor network and reaches a site and an onion service through the port,
+# then reconnects and forgets Tor's data (a second cold join, about 7 MB)
 cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --test live -- --ignored --nocapture
 ```
 

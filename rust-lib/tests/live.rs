@@ -1,4 +1,5 @@
-//! Joins the real Tor network; ignored by default. Run with
+//! Joins the real Tor network, three times (the last one cold, about 7 MB); ignored by
+//! default. Run with
 //! cargo test --no-default-features --test live -- --ignored --nocapture
 
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,24 @@ fn joins_tor_and_reaches_a_site_and_an_onion() {
         println!("{host}: {head:?} in {:.1}s", t.elapsed().as_secs_f64());
         assert!(head.starts_with("HTTP/1."), "{host}: {head:?}");
     }
+
+    // Again on the same port: warm after a reconnect, cold after forgetting Tor's data.
+    for forget in [false, true] {
+        let t = Instant::now();
+        service.reconnect(forget).unwrap();
+        while service.status().state != State::Ready {
+            assert!(t.elapsed() < Duration::from_secs(180), "not ready again: {:?}", service.status());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let st = service.status();
+        println!("forget={forget}: ready again in {:.1}s (joinMs {:?})", t.elapsed().as_secs_f64(), st.join_ms);
+        assert_eq!(st.socks.unwrap().trim_start_matches("socks5h://"), proxy);
+        let head = rt.block_on(http_head(&proxy, "example.com", if forget { "four" } else { "three" }));
+        assert!(head.starts_with("HTTP/1."), "{head:?}");
+    }
+    let c = service.usage();
+    println!("apps sent {} B, received {} B over {} streams", c.sent, c.received, c.opened);
+    assert_eq!(c.opened, 4);
 
     let t = Instant::now();
     service.stop(Duration::from_millis(1500));

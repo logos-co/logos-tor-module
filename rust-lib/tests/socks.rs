@@ -1,55 +1,28 @@
 //! The SOCKS port against a dialer that records each target and echoes, offline.
 
-use std::future::Future;
+mod common;
+
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use logos_tor::socks::{serve, Dial, Dialed, Stream, Target};
+use common::{ping, Echo};
+use logos_tor::socks::{serve, Target};
+use logos_tor::usage::{Counts, Usage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_socks::tcp::Socks5Stream;
-use tor_socksproto::{SocksAuth, SocksStatus};
+use tor_socksproto::SocksAuth;
 
-#[derive(Default)]
-struct Echo {
-    seen: Mutex<Vec<Target>>,
-}
-
-impl Dial for Echo {
-    fn dial(&self, target: Target) -> Pin<Box<dyn Future<Output = Dialed> + Send + '_>> {
-        Box::pin(async move {
-            let gone = target.host == "gone.onion";
-            self.seen.lock().unwrap().push(target);
-            if gone {
-                return Err((SocksStatus::HS_DESC_NOT_FOUND, "no descriptor".into()));
-            }
-            let (ours, theirs) = tokio::io::duplex(1024);
-            tokio::spawn(async move {
-                let (mut r, mut w) = tokio::io::split(theirs);
-                let _ = tokio::io::copy(&mut r, &mut w).await;
-            });
-            Ok(Box::new(ours) as Box<dyn Stream>)
-        })
-    }
-}
-
-async fn start() -> (SocketAddr, Arc<Echo>, watch::Sender<bool>) {
+async fn start() -> (SocketAddr, Arc<Echo>, watch::Sender<bool>, Arc<Usage>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let echo = Arc::new(Echo::default());
+    let usage = Arc::new(Usage::default());
     let (stop, stopped) = watch::channel(false);
-    tokio::spawn(serve(listener, echo.clone(), stopped));
-    (addr, echo, stop)
-}
-
-async fn ping(stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin)) -> [u8; 4] {
-    stream.write_all(b"ping").await.unwrap();
-    let mut back = [0u8; 4];
-    stream.read_exact(&mut back).await.unwrap();
-    back
+    tokio::spawn(serve(listener, echo.clone(), stopped, usage.clone()));
+    (addr, echo, stop, usage)
 }
 
 fn target(host: &str, port: u16, ipv4_only: bool, isolation: SocksAuth) -> Target {
@@ -58,7 +31,7 @@ fn target(host: &str, port: u16, ipv4_only: bool, isolation: SocksAuth) -> Targe
 
 #[tokio::test]
 async fn socks5_relays_and_passes_the_credentials() {
-    let (addr, echo, _stop) = start().await;
+    let (addr, echo, _stop, _) = start().await;
     let mut s = Socks5Stream::connect_with_password(addr, ("zec.rocks", 443), "a1", "b2").await.unwrap();
     assert_eq!(&ping(&mut s).await, b"ping");
     let mut s = Socks5Stream::connect(addr, ("abc.onion", 9067)).await.unwrap();
@@ -72,7 +45,7 @@ async fn socks5_relays_and_passes_the_credentials() {
 
 #[tokio::test]
 async fn socks4a_names_the_host_and_its_user_id() {
-    let (addr, echo, _stop) = start().await;
+    let (addr, echo, _stop, _) = start().await;
     let mut c = TcpStream::connect(addr).await.unwrap();
     // CONNECT to port 18081 at 0.0.0.1, which means "the name follows" (4a).
     let mut request = vec![4, 1, 0x46, 0xa1, 0, 0, 0, 1];
@@ -103,7 +76,7 @@ async fn socks5_reply(addr: SocketAddr, command: u8, host: &str) -> Option<u8> {
 
 #[tokio::test]
 async fn failures_answer_with_their_socks_status() {
-    let (addr, echo, _stop) = start().await;
+    let (addr, echo, _stop, _) = start().await;
     assert_eq!(socks5_reply(addr, 1, "gone.onion").await, Some(0xf0), "onion descriptor not found");
     assert_eq!(socks5_reply(addr, 0xf0, "resolve.example").await, Some(0x07), "Tor's RESOLVE is not served");
     // As on Arti's own port, the handshake refuses BIND: the port closes without a reply.
@@ -113,7 +86,7 @@ async fn failures_answer_with_their_socks_status() {
 
 #[tokio::test]
 async fn stop_closes_the_port() {
-    let (addr, _echo, stop) = start().await;
+    let (addr, _echo, stop, _) = start().await;
     stop.send(true).unwrap();
     for _ in 0..50 {
         if TcpStream::connect(addr).await.is_err() {
@@ -122,4 +95,23 @@ async fn stop_closes_the_port() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the port still accepts after stop");
+}
+
+#[tokio::test]
+async fn counts_what_the_apps_send_and_receive() {
+    let (addr, _echo, _stop, usage) = start().await;
+    let mut s = Socks5Stream::connect(addr, ("zec.rocks", 443)).await.unwrap();
+    assert_eq!(&ping(&mut s).await, b"ping");
+    assert_eq!(usage.counts(), Counts { sent: 4, received: 4, opened: 1, open: 1 }, "the handshake is not counted");
+    drop(s);
+    for _ in 0..50 {
+        if usage.counts().open == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(usage.counts(), Counts { sent: 4, received: 4, opened: 1, open: 0 });
+    // A dial that fails opens no stream.
+    assert!(Socks5Stream::connect(addr, ("gone.onion", 80)).await.is_err());
+    assert_eq!(usage.counts().opened, 1);
 }

@@ -2064,11 +2064,14 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "tokio",
  "tokio-socks",
  "tor-rtcompat",
  "tor-socksproto",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
