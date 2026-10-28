@@ -27,6 +27,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Already in Arti's tree: its log, and this process's memory.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # Provided by logos-module-builder at build time (staged into ../logos-rust-sdk-src).
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }

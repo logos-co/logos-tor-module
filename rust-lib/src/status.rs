@@ -1,12 +1,17 @@
 //! What status() answers and status_changed carries.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Serialize;
+
+use crate::usage::now_ms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    /// Not started: no app has asked for Tor since the module loaded.
+    Idle,
     /// Joining the Tor network; connections wait until it is done.
     Connecting,
     /// Joined: connections go out at once.
@@ -26,14 +31,18 @@ pub struct Status {
     pub detail: String,
     /// `socks5h://127.0.0.1:PORT`, once the port listens.
     pub socks: Option<String>,
+    /// Unix milliseconds when the state began.
+    pub since: u64,
+    /// How long the last start took to reach Ready.
+    pub join_ms: Option<u64>,
 }
 
 impl Status {
-    pub fn starting() -> Self {
-        Self { state: State::Connecting, progress: 0, detail: "starting".into(), socks: None }
+    pub fn idle() -> Self {
+        Self { state: State::Idle, progress: 0, detail: String::new(), socks: None, since: now_ms(), join_ms: None }
     }
 
-    /// `{ ok: true, state, progress, detail, socks }`.
+    /// `{ ok: true, state, progress, detail, socks, since, joinMs }`.
     pub fn to_json(&self) -> String {
         serde_json::json!({
             "ok": true,
@@ -41,6 +50,8 @@ impl Status {
             "progress": self.progress,
             "detail": self.detail,
             "socks": self.socks,
+            "since": self.since,
+            "joinMs": self.join_ms,
         })
         .to_string()
     }
@@ -72,16 +83,23 @@ pub type Sink = Arc<dyn Fn(&Status) + Send + Sync>;
 #[derive(Clone)]
 pub struct Tracker {
     status: Arc<Mutex<Status>>,
+    launched: Arc<Mutex<Instant>>,
     sink: Sink,
 }
 
 impl Tracker {
     pub fn new(sink: Sink) -> Self {
-        Self { status: Arc::new(Mutex::new(Status::starting())), sink }
+        Self { status: Arc::new(Mutex::new(Status::idle())), launched: Arc::new(Mutex::new(Instant::now())), sink }
     }
 
     pub fn get(&self) -> Status {
         self.status.lock().unwrap().clone()
+    }
+
+    /// Tor starts again: connecting from 0%, and the join is timed from now.
+    pub fn relaunch(&self, detail: &str) {
+        *self.launched.lock().unwrap() = Instant::now();
+        self.update(|s| (s.state, s.progress, s.detail, s.join_ms, s.since) = (State::Connecting, 0, detail.to_string(), None, now_ms()));
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Status)) {
@@ -89,6 +107,12 @@ impl Tracker {
             let mut s = self.status.lock().unwrap();
             let before = (s.state, s.progress, s.socks.clone());
             f(&mut s);
+            if s.state != before.0 {
+                s.since = now_ms();
+                if s.state == State::Ready && s.join_ms.is_none() {
+                    s.join_ms = Some(self.launched.lock().unwrap().elapsed().as_millis() as u64);
+                }
+            }
             (before != (s.state, s.progress, s.socks.clone())).then(|| s.clone())
         };
         if let Some(s) = now {
@@ -131,7 +155,27 @@ mod tests {
         tracker.update(|s| (s.state, s.progress) = (State::Ready, 100));
         let heard = heard.lock().unwrap();
         assert_eq!(heard.len(), 2);
-        let last: serde_json::Value = serde_json::from_str(&heard[1]).unwrap();
+        let mut last: serde_json::Value = serde_json::from_str(&heard[1]).unwrap();
+        assert!(last["since"].as_u64().unwrap() > 0 && last["joinMs"].is_u64(), "{last}");
+        for k in ["since", "joinMs"] {
+            last.as_object_mut().unwrap().remove(k);
+        }
         assert_eq!(last, serde_json::json!({ "ok": true, "state": "ready", "progress": 100, "detail": "fetching 20/9185", "socks": "socks5h://127.0.0.1:9" }));
+    }
+
+    #[test]
+    fn a_relaunch_times_the_next_join() {
+        let tracker = Tracker::new(Arc::new(|_| {}));
+        tracker.update(|s| s.state = State::Ready);
+        let first = tracker.get();
+        assert!(first.join_ms.is_some());
+        tracker.relaunch("reconnecting");
+        let again = tracker.get();
+        assert_eq!((again.state, again.progress, again.join_ms, again.detail.as_str()), (State::Connecting, 0, None, "reconnecting"));
+        assert!(again.since >= first.since);
+        tracker.update(|s| s.progress = 40);
+        assert_eq!(tracker.get().since, again.since, "progress alone keeps since");
+        tracker.update(|s| s.state = State::Ready);
+        assert!(tracker.get().join_ms.is_some());
     }
 }
