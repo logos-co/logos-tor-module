@@ -35,6 +35,10 @@ response("9f1c…")   -> { "ok": true, "state": "done", "status": 200, "headers"
 - **Circuits:** requests with the same `isolation` may share a circuit, and an HTTP/2
   connection, as a gRPC client's calls do; with none, each request gets its own. Two
   modules never share a circuit, whatever keys they pick.
+- **A failing exit:** when the exit relay fails a connection (a name it could not resolve,
+  its exit policy, a timeout or an error there), it is tried again on a fresh circuit, three
+  tries in all, as Tor's own client does. The key's later requests stay off the failed
+  circuit too; Arti alone would keep giving it new streams for 10 minutes.
 - A finished request is answered once, as `done` or `{ state: "failed", error }`, then
   forgotten. Only the module that started it may ask for it or `cancel(request)` it.
 - Limits: 64 requests in flight per module, 8 MB of request body, 64 MB of response body,
@@ -85,7 +89,8 @@ and Tor Browser's 9150. The choice is saved in `settings.json` in the instance d
   `socks5h` or 4a: resolving locally would leak them.
 - **Circuits follow the SOCKS credentials**, as with Tor's `IsolateSOCKSAuth`: streams
   whose username and password differ never share a circuit. Streams without credentials
-  can share circuits with each other.
+  can share circuits with each other. A stream a failing exit ends is tried again on a fresh
+  circuit, as requests are.
 - Onion services are reachable. A failure answers with the status Arti's own SOCKS port
   gives, onion service codes included (Tor proposal 304).
 - No authentication is required, as with a system Tor: any program on this computer can

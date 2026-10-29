@@ -60,3 +60,8 @@ logos_module = ["dep:logos-rust-sdk"]
 
 [profile.release]
 panic = "unwind"
+
+# saturating-time 0.5.0 never returns on Windows (SystemTime moves in 100 ns steps), so Arti
+# hung parsing the consensus. Vendored with the fix until a release has one (arti#2678).
+[patch.crates-io]
+saturating-time = { path = "vendor/saturating-time" }
