@@ -1,5 +1,5 @@
-//! The service around a fake Tor, offline: the port across reconnects, the counts, the
-//! files forgotten, and a Tor that cannot start.
+//! The service around a fake Tor, offline: the SOCKS port setting and the port across
+//! reconnects, the counts, the files forgotten, and a Tor that cannot start.
 
 mod common;
 
@@ -61,10 +61,12 @@ impl Dial for FakeTor {
 
 type Heard = Arc<Mutex<Vec<Status>>>;
 
+/// With the SOCKS port on, at a free port on loopback.
 fn start(dir: &Path, fake: Arc<Fake>) -> (Service, Heard) {
     let heard: Heard = Arc::default();
     let log = heard.clone();
-    let service = Service::start_with(dir, Arc::new(move |s| log.lock().unwrap().push(s.clone())), fake).unwrap();
+    let service = Service::start_with(dir, None, Arc::new(move |s| log.lock().unwrap().push(s.clone())), fake).unwrap();
+    service.set_socks(true, "127.0.0.1:0").unwrap();
     (service, heard)
 }
 
@@ -181,4 +183,47 @@ fn after_stop_the_port_is_closed_and_reconnect_refused() {
     service.stop(Duration::from_millis(500));
     assert_eq!(service.reconnect(false), Err("stopped".to_string()));
     assert!(std::net::TcpStream::connect(addr.as_str()).is_err(), "the port still accepts");
+}
+
+#[test]
+fn the_socks_port_is_off_until_turned_on_and_the_choice_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    let sink = || Arc::new(|_: &Status| {});
+    let service = Service::start_with(&dir.path().join("arti"), Some(settings.clone()), sink(), Arc::new(Fake::default())).unwrap();
+    let off = service.socks();
+    assert_eq!((off.setting.enabled, off.setting.address.as_str(), off.listening), (false, "127.0.0.1:9250", None));
+    assert_eq!(service.status().socks, None);
+
+    let on = service.set_socks(true, "127.0.0.1:0").unwrap();
+    let addr = on.listening.expect("listening");
+    assert_eq!(service.status().socks, Some(format!("socks5h://{addr}")));
+    assert!(std::net::TcpStream::connect(addr).is_ok());
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(saved["socks"], serde_json::json!({ "enabled": true, "address": "127.0.0.1:0" }));
+
+    // A taken port or a bad address is refused, and the port stays as it was.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = taken.local_addr().unwrap().to_string();
+    assert!(service.set_socks(true, &busy).unwrap_err().contains("cannot listen"));
+    assert!(service.set_socks(true, "localhost:9250").unwrap_err().contains("not an IP address"));
+    assert_eq!(service.socks().listening, Some(addr));
+
+    let closed = service.set_socks(false, "127.0.0.1:0").unwrap();
+    assert_eq!((closed.setting.enabled, closed.listening), (false, None));
+    assert_eq!(service.status().socks, None);
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(addr).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(std::net::TcpStream::connect(addr).is_err(), "the port still accepts");
+    service.stop(Duration::from_millis(500));
+
+    // Loaded again, it follows the saved choice.
+    std::fs::write(&settings, r#"{"socks":{"enabled":true,"address":"127.0.0.1:0"}}"#).unwrap();
+    let again = Service::start_with(&dir.path().join("arti"), Some(settings), sink(), Arc::new(Fake::default())).unwrap();
+    assert!(again.socks().listening.is_some() && again.status().socks.is_some());
+    again.stop(Duration::from_millis(500));
 }

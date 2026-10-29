@@ -1,5 +1,5 @@
-//! What Tor carried for the apps since the module started, who follows it, and what it
-//! costs this computer.
+//! What Tor carried since the module started, for which module, and what it costs this
+//! computer.
 
 use std::collections::HashMap;
 use std::io;
@@ -12,44 +12,106 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// A module that has not asked for Tor's status this long is no longer following it.
+/// A module that has not asked anything of Tor this long is no longer following it.
 pub const FOLLOW_WINDOW_MS: u64 = 90_000;
 
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// Byte and stream counts over every SOCKS client.
+/// Bytes into Tor and out of it.
 #[derive(Debug, Default)]
-pub struct Usage {
+pub struct Meter {
     sent: AtomicU64,
     received: AtomicU64,
+}
+
+impl Meter {
+    pub fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    pub fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
+    }
+}
+
+/// One module's requests over IPC.
+#[derive(Debug, Default)]
+pub struct AppMeter {
+    pub meter: Arc<Meter>,
+    requests: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppCounts {
+    pub module: String,
+    pub sent: u64,
+    pub received: u64,
+    pub requests: u64,
+}
+
+/// Every module's traffic over IPC, the SOCKS port's, and the Tor streams behind both.
+#[derive(Debug, Default)]
+pub struct Usage {
+    /// Programs on the SOCKS port, which have no name Tor could know.
+    socks: Arc<Meter>,
     opened: AtomicU64,
     open: AtomicU64,
+    apps: Mutex<HashMap<String, Arc<AppMeter>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
-    /// From the apps into Tor.
+    /// From the apps and programs into Tor.
     pub sent: u64,
-    /// From Tor back to the apps.
+    /// From Tor back to them.
     pub received: u64,
-    /// Streams Tor opened, and those still open.
+    /// Tor streams opened, and those still open.
     pub opened: u64,
     pub open: u64,
 }
 
 impl Usage {
     pub fn counts(&self) -> Counts {
-        Counts {
-            sent: self.sent.load(Ordering::Relaxed),
-            received: self.received.load(Ordering::Relaxed),
-            opened: self.opened.load(Ordering::Relaxed),
-            open: self.open.load(Ordering::Relaxed),
+        let (mut sent, mut received) = (self.socks.sent(), self.socks.received());
+        for a in self.apps.lock().unwrap().values() {
+            sent += a.meter.sent();
+            received += a.meter.received();
         }
+        Counts { sent, received, opened: self.opened.load(Ordering::Relaxed), open: self.open.load(Ordering::Relaxed) }
     }
 
-    /// Counts a stream as open until the guard drops.
+    pub fn socks(&self) -> &Arc<Meter> {
+        &self.socks
+    }
+
+    /// `module`'s meter, counting one more request.
+    pub fn request_by(&self, module: &str) -> Arc<AppMeter> {
+        let app = self.apps.lock().unwrap().entry(module.to_string()).or_default().clone();
+        app.requests.fetch_add(1, Ordering::Relaxed);
+        app
+    }
+
+    /// By module name.
+    pub fn apps(&self) -> Vec<AppCounts> {
+        let mut out: Vec<AppCounts> = self
+            .apps
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, a)| AppCounts {
+                module: m.clone(),
+                sent: a.meter.sent(),
+                received: a.meter.received(),
+                requests: a.requests.load(Ordering::Relaxed),
+            })
+            .collect();
+        out.sort_by(|a, b| a.module.cmp(&b.module));
+        out
+    }
+
+    /// Counts a Tor stream as open until the guard drops.
     pub fn open_stream(self: &Arc<Self>) -> OpenStream {
         self.opened.fetch_add(1, Ordering::Relaxed);
         self.open.fetch_add(1, Ordering::Relaxed);
@@ -65,15 +127,30 @@ impl Drop for OpenStream {
     }
 }
 
-/// The app's end of a stream, counting what passes through it.
+/// Which way the bytes a stream reads go: on the app's end of a SOCKS stream they go into
+/// Tor; on Tor's end of a request they come out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    Sent,
+    Received,
+}
+
+/// A stream counting what passes through it into a meter.
 pub struct Counted<S> {
     inner: S,
-    usage: Arc<Usage>,
+    meter: Arc<Meter>,
+    reads: Reads,
 }
 
 impl<S> Counted<S> {
-    pub fn new(inner: S, usage: Arc<Usage>) -> Self {
-        Self { inner, usage }
+    pub fn new(inner: S, meter: Arc<Meter>, reads: Reads) -> Self {
+        Self { inner, meter, reads }
+    }
+
+    fn count(&self, read: bool, n: usize) {
+        let into_tor = read == (self.reads == Reads::Sent);
+        let way = if into_tor { &self.meter.sent } else { &self.meter.received };
+        way.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
 
@@ -82,7 +159,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
-            self.usage.sent.fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+            self.count(true, buf.filled().len() - before);
         }
         polled
     }
@@ -92,7 +169,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         let polled = Pin::new(&mut self.inner).poll_write(cx, data);
         if let Poll::Ready(Ok(n)) = polled {
-            self.usage.received.fetch_add(n as u64, Ordering::Relaxed);
+            self.count(false, n);
         }
         polled
     }
@@ -106,7 +183,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
     }
 }
 
-/// Modules that asked for Tor's status lately, by name: the apps following it.
+/// Modules that asked Tor for anything lately, by name: the apps following it.
 #[derive(Default)]
 pub struct Followers(Mutex<HashMap<String, u64>>);
 
@@ -115,13 +192,16 @@ impl Followers {
         self.0.lock().unwrap().insert(module.to_string(), at);
     }
 
-    /// `(module, last asked)` for those seen within the window, by name.
-    pub fn recent(&self, now: u64) -> Vec<(String, u64)> {
-        let mut seen = self.0.lock().unwrap();
-        seen.retain(|_, at| now.saturating_sub(*at) <= FOLLOW_WINDOW_MS);
-        let mut out: Vec<_> = seen.iter().map(|(m, at)| (m.clone(), *at)).collect();
+    /// `(module, last asked)` for every module seen, by name.
+    pub fn all(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<_> = self.0.lock().unwrap().iter().map(|(m, at)| (m.clone(), *at)).collect();
         out.sort();
         out
+    }
+
+    /// Those seen within the window.
+    pub fn recent(&self, now: u64) -> Vec<(String, u64)> {
+        self.all().into_iter().filter(|(_, at)| now.saturating_sub(*at) <= FOLLOW_WINDOW_MS).collect()
     }
 }
 
@@ -153,10 +233,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn counts_both_ways_and_open_streams() {
+    async fn counts_each_end_its_own_way() {
         let usage = Arc::new(Usage::default());
+        // The app's end of a SOCKS stream: what it reads goes into Tor.
         let (app, mut far) = tokio::io::duplex(64);
-        let mut app = Counted::new(app, usage.clone());
+        let mut app = Counted::new(app, usage.socks().clone(), Reads::Sent);
         let open = usage.open_stream();
         far.write_all(b"hello").await.unwrap();
         let mut got = [0u8; 5];
@@ -165,7 +246,21 @@ mod tests {
         assert_eq!(usage.counts(), Counts { sent: 5, received: 2, opened: 1, open: 1 });
         drop(open);
         assert_eq!(usage.counts().open, 0);
-        assert_eq!(usage.counts().opened, 1);
+
+        // Tor's end of a module's request: what it reads came out of Tor.
+        let zcash = usage.request_by("zcash_node_module");
+        let (tor, mut far) = tokio::io::duplex(64);
+        let mut tor = Counted::new(tor, zcash.meter.clone(), Reads::Received);
+        tor.write_all(b"GET").await.unwrap();
+        far.write_all(b"200 OK").await.unwrap();
+        let mut got = [0u8; 6];
+        tor.read_exact(&mut got).await.unwrap();
+        usage.request_by("zcash_node_module");
+        assert_eq!(
+            usage.apps(),
+            [AppCounts { module: "zcash_node_module".into(), sent: 3, received: 6, requests: 2 }]
+        );
+        assert_eq!((usage.counts().sent, usage.counts().received), (8, 8));
     }
 
     #[test]

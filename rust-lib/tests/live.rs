@@ -1,10 +1,11 @@
-//! Joins the real Tor network, three times (the last one cold, about 7 MB); ignored by
-//! default. Run with
+//! Joins the real Tor network, three times (the last one cold, about 7 MB), and reaches it
+//! through the SOCKS port and with requests; ignored by default. Run with
 //! cargo test --no-default-features --test live -- --ignored --nocapture
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use logos_tor::requests::Polled;
 use logos_tor::service::Service;
 use logos_tor::status::{State, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,8 +29,9 @@ fn joins_tor_and_reaches_a_site_and_an_onion() {
     let heard: Arc<Mutex<Vec<Status>>> = Arc::default();
     let log = heard.clone();
     let t0 = Instant::now();
-    let service = Service::start(dir.path(), Arc::new(move |s| log.lock().unwrap().push(s.clone()))).unwrap();
+    let service = Service::start(dir.path(), None, Arc::new(move |s| log.lock().unwrap().push(s.clone()))).unwrap();
     assert_eq!(service.status().state, State::Idle);
+    service.set_socks(true, "127.0.0.1:0").unwrap();
     service.demand();
     while service.status().state != State::Ready {
         assert!(t0.elapsed() < Duration::from_secs(180), "not ready: {:?}", service.status());
@@ -46,6 +48,32 @@ fn joins_tor_and_reaches_a_site_and_an_onion() {
         assert!(head.starts_with("HTTP/1."), "{host}: {head:?}");
     }
 
+    // Requests over IPC: gRPC over HTTP/2 to a lightwalletd server, then the onion service.
+    let ask = |owner: &str, spec: serde_json::Value, body: &[u8]| {
+        let t = Instant::now();
+        let id = service.request(owner, serde_json::from_value(spec).unwrap(), body.to_vec()).unwrap();
+        loop {
+            match service.response(owner, &id) {
+                Some(Polled::Pending) => std::thread::sleep(Duration::from_millis(50)),
+                Some(Polled::Done(answer)) => break (answer.unwrap(), t.elapsed()),
+                None => panic!("lost {id}"),
+            }
+        }
+    };
+    let grpc = serde_json::json!({
+        "method": "POST", "url": "https://testnet.zec.rocks/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
+        "http2": true, "isolation": "grpc", "headers": [["content-type", "application/grpc"], ["te", "trailers"]],
+    });
+    let (info, took) = ask("zcash_node_module", grpc.clone(), &[0, 0, 0, 0, 0]);
+    println!("GetLightdInfo: {} {:?}, {} bytes in {:.1}s", info.status, info.trailers, info.body.len(), took.as_secs_f64());
+    assert!(info.status == 200 && info.trailers.contains(&("grpc-status".into(), "0".into())) && info.body.len() > 5);
+    let (_, again) = ask("zcash_node_module", grpc, &[0, 0, 0, 0, 0]);
+    println!("again on the same key and connection in {:.1}s", again.as_secs_f64());
+    let (page, took) = ask("live_test", serde_json::json!({ "url": format!("http://{ONION}/") }), b"");
+    println!("{ONION} over HTTP/1.1: {} in {:.1}s", page.status, took.as_secs_f64());
+    assert!((200..400).contains(&page.status));
+    println!("by module: {:?}", service.apps());
+
     // Again on the same port: warm after a reconnect, cold after forgetting Tor's data.
     for forget in [false, true] {
         let t = Instant::now();
@@ -61,8 +89,8 @@ fn joins_tor_and_reaches_a_site_and_an_onion() {
         assert!(head.starts_with("HTTP/1."), "{head:?}");
     }
     let c = service.usage();
-    println!("apps sent {} B, received {} B over {} streams", c.sent, c.received, c.opened);
-    assert_eq!(c.opened, 4);
+    println!("sent {} B, received {} B over {} streams", c.sent, c.received, c.opened);
+    assert_eq!(c.opened, 6);
 
     let t = Instant::now();
     service.stop(Duration::from_millis(1500));

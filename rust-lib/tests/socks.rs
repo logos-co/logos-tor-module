@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use common::{ping, Echo};
 use logos_tor::socks::{serve, Target};
+use logos_tor::tor::Isolation;
 use logos_tor::usage::{Counts, Usage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,7 +27,7 @@ async fn start() -> (SocketAddr, Arc<Echo>, watch::Sender<bool>, Arc<Usage>) {
 }
 
 fn target(host: &str, port: u16, ipv4_only: bool, isolation: SocksAuth) -> Target {
-    Target { host: host.into(), port, ipv4_only, isolation }
+    Target { host: host.into(), port, ipv4_only, isolation: Isolation::Socks(isolation) }
 }
 
 #[tokio::test]

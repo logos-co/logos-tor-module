@@ -1,7 +1,10 @@
-//! Tor for Logos modules: Arti in this process, behind a SOCKS port on loopback.
+//! Tor for Logos modules: Arti in this process, which modules reach with requests over IPC,
+//! and other programs through a SOCKS port when the user turns it on.
 
 pub mod gate;
+pub mod http;
 pub mod logbook;
+pub mod requests;
 pub mod service;
 pub mod socks;
 pub mod status;

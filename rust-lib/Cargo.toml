@@ -22,9 +22,20 @@ arti-client = { version = "0.47", default-features = false, features = [
 ] }
 tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "rustls"] }
 tor-socksproto = "0.47"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 futures = "0.3"
+# Requests over IPC: HTTP/1.1 and HTTP/2 (gRPC), TLS against the Mozilla roots.
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+base64 = "0.23"
+getrandom = "0.3"
+hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Already in Arti's tree: its log, and this process's memory.
@@ -38,6 +49,10 @@ logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio-socks = "0.5"
+# A TLS and HTTP/1.1 + HTTP/2 server on the far side of the fake Tor.
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server-auto"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 [features]
 default = ["logos_module"]
