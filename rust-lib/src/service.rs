@@ -1,5 +1,5 @@
 //! The running module: Arti in a tokio runtime, which modules reach with requests over IPC
-//! and, when the user turns it on, other programs reach through a SOCKS port. Arti joins the
+//! and, unless the user turns it off, through a SOCKS port, as other programs do. Arti joins the
 //! Tor network only once something asks for it: an app's status() call or request, a SOCKS
 //! client, or the user. The SOCKS port outlives each run of Arti, so a reconnect keeps it.
 
@@ -32,9 +32,16 @@ const RETRY: Duration = Duration::from_secs(60);
 /// What a reconnect gives the old run to stop: blocking work past it is left to finish.
 const RESTART_GRACE: Duration = Duration::from_millis(500);
 
-/// Where the SOCKS port listens when the user turns it on and names no address: clear of a
-/// system Tor's 9050 and Tor Browser's 9150.
+/// Where the SOCKS port listens unless the user names another address: clear of a system
+/// Tor's 9050 and Tor Browser's 9150.
 pub const DEFAULT_SOCKS: &str = "127.0.0.1:9250";
+
+/// Where the port listens instead when its address is taken as the module starts, as by
+/// another Logos profile's Tor: apps read the port from status().
+const FALLBACK_SOCKS: &str = "127.0.0.1:0";
+
+/// settings.json files without this version were saved while the port was off by default.
+const SETTINGS_VERSION: u32 = 1;
 
 /// What answers behind the IPC requests and the SOCKS port: Arti in the module, a fake in tests.
 pub trait Engine: Send + Sync + 'static {
@@ -98,7 +105,8 @@ impl Dial for Down {
     }
 }
 
-/// The SOCKS port setting: off unless the user turns it on.
+/// The SOCKS port setting: on unless the user turns it off. Wallets that make raw connections
+/// (Electrum, Bitcoin peers) reach Tor through it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocksSetting {
@@ -108,7 +116,7 @@ pub struct SocksSetting {
 
 impl Default for SocksSetting {
     fn default() -> Self {
-        Self { enabled: false, address: DEFAULT_SOCKS.into() }
+        Self { enabled: true, address: DEFAULT_SOCKS.into() }
     }
 }
 
@@ -116,7 +124,21 @@ impl Default for SocksSetting {
 #[serde(rename_all = "camelCase")]
 struct Settings {
     #[serde(default)]
+    version: u32,
+    #[serde(default)]
     socks: SocksSetting,
+}
+
+impl Settings {
+    /// The saved choice. A file from before the port was on by default turns it on once: the
+    /// wallets now rely on it.
+    fn load(path: Option<&Path>) -> Self {
+        let mut saved: Self = path.and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        if saved.version < SETTINGS_VERSION {
+            saved.socks.enabled = true;
+        }
+        saved
+    }
 }
 
 /// The SOCKS port as it is: the setting, where it listens, or why it does not.
@@ -203,17 +225,21 @@ impl Service {
     }
 
     pub fn start_with(dir: &Path, settings: Option<PathBuf>, sink: Sink, engine: Arc<dyn Engine>) -> Result<Self, String> {
-        let saved: Settings = settings
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let saved = Settings::load(settings.as_deref());
         let tracker = Tracker::new(sink);
         let mut socks = Socks { setting: saved.socks, listener: None, error: None };
         if socks.setting.enabled {
             match socks.setting.address.parse::<SocketAddr>().map_err(|_| format!("bad address {}", socks.setting.address)).and_then(bind) {
                 Ok(l) => socks.listener = Some(l),
-                Err(e) => socks.error = Some(e),
+                // Taken, as by another profile's Tor: a free port on loopback keeps the apps working.
+                Err(e) => match bind(FALLBACK_SOCKS.parse().unwrap()) {
+                    Ok(l) => {
+                        let at = l.local_addr().map(|a| a.to_string()).unwrap_or_default();
+                        socks.error = Some(format!("{e}; listening on {at} instead"));
+                        socks.listener = Some(l);
+                    }
+                    Err(_) => socks.error = Some(e),
+                },
             }
         }
         if let Some(url) = socks.listener.as_ref().and_then(socks_url) {
@@ -363,7 +389,7 @@ impl Service {
         }
         let url = listener.as_ref().and_then(socks_url);
         (socks.listener, socks.setting, socks.error) = (listener, SocksSetting { enabled, address: address.to_string() }, None);
-        let saved = Settings { socks: socks.setting.clone() };
+        let saved = Settings { version: SETTINGS_VERSION, socks: socks.setting.clone() };
         drop(socks);
         drop(run);
         self.tracker.update(|s| s.socks = url);

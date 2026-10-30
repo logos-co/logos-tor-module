@@ -1,5 +1,5 @@
 //! Tor for Logos modules: Arti in this process, which modules reach with requests over IPC,
-//! and other programs through a SOCKS port when the user turns it on.
+//! and through a SOCKS port, on unless the user turns it off, for raw connections.
 
 pub mod gate;
 pub mod http;

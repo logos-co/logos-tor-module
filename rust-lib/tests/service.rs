@@ -61,7 +61,7 @@ impl Dial for FakeTor {
 
 type Heard = Arc<Mutex<Vec<Status>>>;
 
-/// With the SOCKS port on, at a free port on loopback.
+/// With the SOCKS port at a free port on loopback.
 fn start(dir: &Path, fake: Arc<Fake>) -> (Service, Heard) {
     let heard: Heard = Arc::default();
     let log = heard.clone();
@@ -186,21 +186,19 @@ fn after_stop_the_port_is_closed_and_reconnect_refused() {
 }
 
 #[test]
-fn the_socks_port_is_off_until_turned_on_and_the_choice_is_saved() {
+fn the_socks_port_is_on_by_default_and_the_choice_is_saved() {
     let dir = tempfile::tempdir().unwrap();
     let settings = dir.path().join("settings.json");
     let sink = || Arc::new(|_: &Status| {});
-    let service = Service::start_with(&dir.path().join("arti"), Some(settings.clone()), sink(), Arc::new(Fake::default())).unwrap();
-    let off = service.socks();
-    assert_eq!((off.setting.enabled, off.setting.address.as_str(), off.listening), (false, "127.0.0.1:9250", None));
-    assert_eq!(service.status().socks, None);
-
-    let on = service.set_socks(true, "127.0.0.1:0").unwrap();
+    let start = |path: &Path| Service::start_with(&dir.path().join("arti"), Some(path.to_path_buf()), sink(), Arc::new(Fake::default())).unwrap();
+    // At 9250, or at a free port if something here holds it.
+    let service = start(&settings);
+    let on = service.socks();
+    assert_eq!((on.setting.enabled, on.setting.address.as_str()), (true, "127.0.0.1:9250"));
     let addr = on.listening.expect("listening");
     assert_eq!(service.status().socks, Some(format!("socks5h://{addr}")));
     assert!(std::net::TcpStream::connect(addr).is_ok());
-    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-    assert_eq!(saved["socks"], serde_json::json!({ "enabled": true, "address": "127.0.0.1:0" }));
+    assert!(!settings.exists(), "nothing chosen, nothing saved");
 
     // A taken port or a bad address is refused, and the port stays as it was.
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -209,7 +207,7 @@ fn the_socks_port_is_off_until_turned_on_and_the_choice_is_saved() {
     assert!(service.set_socks(true, "localhost:9250").unwrap_err().contains("not an IP address"));
     assert_eq!(service.socks().listening, Some(addr));
 
-    let closed = service.set_socks(false, "127.0.0.1:0").unwrap();
+    let closed = service.set_socks(false, "127.0.0.1:9250").unwrap();
     assert_eq!((closed.setting.enabled, closed.listening), (false, None));
     assert_eq!(service.status().socks, None);
     for _ in 0..50 {
@@ -219,11 +217,29 @@ fn the_socks_port_is_off_until_turned_on_and_the_choice_is_saved() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(std::net::TcpStream::connect(addr).is_err(), "the port still accepts");
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(saved, serde_json::json!({ "version": 1, "socks": { "enabled": false, "address": "127.0.0.1:9250" } }));
     service.stop(Duration::from_millis(500));
 
-    // Loaded again, it follows the saved choice.
-    std::fs::write(&settings, r#"{"socks":{"enabled":true,"address":"127.0.0.1:0"}}"#).unwrap();
-    let again = Service::start_with(&dir.path().join("arti"), Some(settings), sink(), Arc::new(Fake::default())).unwrap();
-    assert!(again.socks().listening.is_some() && again.status().socks.is_some());
+    // Loaded again, it follows the saved choice: off stays off.
+    let again = start(&settings);
+    assert_eq!((again.socks().setting.enabled, again.socks().listening, again.status().socks), (false, None, None));
     again.stop(Duration::from_millis(500));
+
+    // A file saved while the port was off by default turns it on once.
+    std::fs::write(&settings, r#"{"socks":{"enabled":false,"address":"127.0.0.1:0"}}"#).unwrap();
+    let old = start(&settings);
+    assert!(old.socks().setting.enabled && old.socks().listening.is_some() && old.status().socks.is_some());
+    old.stop(Duration::from_millis(500));
+
+    // Its address taken as the module starts, as by another profile's Tor: a free port, and why.
+    std::fs::write(&settings, format!(r#"{{"version":1,"socks":{{"enabled":true,"address":"{busy}"}}}}"#)).unwrap();
+    let elsewhere = start(&settings);
+    let s = elsewhere.socks();
+    assert_eq!(s.setting.address, busy, "the choice is kept for the next start");
+    assert!(s.listening.is_some_and(|a| a.to_string() != busy && a.ip().is_loopback()), "{s:?}");
+    assert!(s.error.as_deref().is_some_and(|e| e.contains("cannot listen") && e.contains("instead")), "{s:?}");
+    assert_eq!(elsewhere.status().socks, s.listening.map(|a| format!("socks5h://{a}")));
+    elsewhere.stop(Duration::from_millis(500));
+    drop(taken);
 }
