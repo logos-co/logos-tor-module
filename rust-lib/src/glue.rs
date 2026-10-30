@@ -20,7 +20,7 @@ const NOT_AUTHORIZED: &str = r#"{"ok":false,"error":"not authorized"}"#;
 pub trait TorModule: Send + Sync + 'static {
     /// `{ ok, state, progress, detail, socks, since, joinMs }`. `state` is idle, connecting,
     /// ready, blocked or failed; `progress` is the percent joined; `socks` is the SOCKS port,
-    /// `socks5h://IP:PORT`, while the user has it on, else null; `since` is when the state
+    /// `socks5h://IP:PORT`, where it listens, else null (turned off); `since` is when the state
     /// began (unix ms); `joinMs` is how long the last start took to be ready. A module that
     /// asks starts Tor if it is idle, so it never reads idle itself, and counts as an app
     /// following Tor for 90 s.

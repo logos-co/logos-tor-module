@@ -3,8 +3,9 @@
 `tor_module`: Tor for Logos modules, so no one has to install or run Tor themselves. It
 runs [Arti](https://gitlab.torproject.org/tpo/core/arti), the Tor Project's Tor in Rust,
 inside the module's own process. Modules make their requests through it over IPC: the
-module learns who is asking, keeps each module's circuits apart, and opens no port. Other
-programs can reach it through a SOCKS port, which the user turns on in the Tor app.
+module learns who is asking and keeps each module's circuits apart. Wallets whose
+connections are not HTTP (Electrum, Bitcoin peers, Monero's wallet) and other programs
+reach it through a SOCKS port on loopback, which the user can turn off in the Tor app.
 
 ## Requests over IPC
 
@@ -71,7 +72,8 @@ response("9f1c…")   -> { "ok": true, "state": "done", "status": 200, "headers"
   connection, so a user whose apps all skip Tor shows no Tor traffic on the network. A
   request, a `status()` call from another module, or a SOCKS client starts the join, so a
   module never reads `idle` itself. Once started, Tor runs until the module unloads.
-- `socks` is the SOCKS port, `socks5h://IP:PORT`, while the user has it on; else null.
+- `socks` is the SOCKS port, `socks5h://IP:PORT`, where it listens; null while the user
+  has it off. A module that uses the port reads it here rather than assuming 9250.
 - `since` is when the state began (unix ms); `joinMs`, how long the last start took to
   be ready.
 - `status_changed(payload)` carries the same reply whenever the state, the progress or
@@ -81,9 +83,17 @@ response("9f1c…")   -> { "ok": true, "state": "done", "status": 200, "headers"
 
 ## The SOCKS port
 
-Off unless the user turns it on in the Tor app, for programs outside Logos. It listens at
-`127.0.0.1:9250` unless the user names another IP and port, clear of a system Tor's 9050
-and Tor Browser's 9150. The choice is saved in `settings.json` in the instance directory.
+On unless the user turns it off in the Tor app: wallets whose connections are not HTTP use
+it, as can programs outside Logos. It listens at `127.0.0.1:9250` unless the user names
+another IP and port, clear of a system Tor's 9050 and Tor Browser's 9150. The choice is
+saved in `settings.json` in the instance directory.
+
+- When the address is taken as the module starts, as by another Logos profile's Tor, the
+  port listens on a free port on loopback instead, and `settings()` says why. `status()`
+  always names the port in use.
+- A `settings.json` from before the port was on by default (one without `"version": 1`)
+  turns it on once. A choice saved since is kept, off included; a wallet set to use the
+  Tor that comes with Logos then says the port is off.
 
 - SOCKS4, 4a and 5, `CONNECT` only. Names are resolved by Tor at the exit, so use
   `socks5h` or 4a: resolving locally would leak them.
@@ -93,8 +103,9 @@ and Tor Browser's 9150. The choice is saved in `settings.json` in the instance d
   circuit, as requests are.
 - Onion services are reachable. A failure answers with the status Arti's own SOCKS port
   gives, onion service codes included (Tor proposal 304).
-- No authentication is required, as with a system Tor: any program on this computer can
-  use the port, and on an address other than loopback, any computer that reaches it.
+- No authentication is required, as with a system Tor or Tor Browser: any program on this
+  computer can use the port, and on an address other than loopback, any computer that
+  reaches it. Its traffic counts as the SOCKS port's, not any one app's.
 - The port stays the same through a Reconnect. Nothing about a connection's target is
   logged.
 
